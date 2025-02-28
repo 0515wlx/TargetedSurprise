@@ -26,7 +26,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     """结合 TargetedSurprise 进行推理"""
     results = []
     
-    for item in data[:10]:  # 测试前10个样本
+    for item in data[:2]:  # 测试前2个样本
         # 准备输入（添加长度检查）
         context = item['context']
         question = item['question']
