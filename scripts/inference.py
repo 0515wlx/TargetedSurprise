@@ -7,19 +7,20 @@ from src.TargetedSurprise import TargetedSurprise
 
 class ChunkOptimizer:
     """动态分块优化类"""
-    def __init__(self, model, chunk_size=4096, overlap=256):
+    def __init__(self, model, chunk_size=512, overlap=64):
         self.model = model
         self.chunk_size = chunk_size
         self.overlap = overlap
         
     def process_chunks(self, input_ids, past_key_values=None):
         """使用环形缓冲区实现滑动窗口分块，支持kv_cache"""
+        next_token_logits = None
         seq_len = input_ids.size(1)
-        window = torch.empty((1, self.chunk_size), dtype=torch.long, device=input_ids.device)
+        window = torch.zeros((1, self.chunk_size), dtype=torch.long, device=input_ids.device)
         
         # 初始化窗口
         start_pos = max(0, seq_len - self.chunk_size)
-        window.copy_(input_ids[:, start_pos:])
+        window[:, :input_ids.size(1)-start_pos].copy_(input_ids[:, start_pos:])
         
         # 逆向滑动处理
         for pos in range(seq_len - self.chunk_size, -self.chunk_size, -self.chunk_size + self.overlap):
@@ -28,7 +29,7 @@ class ChunkOptimizer:
             
             # 更新窗口内容
             if pos != start_pos:
-                window[:, :-self.overlap] = window[:, self.overlap:]
+                window[:, :-self.overlap] = window[:, self.overlap:].clone()
                 window[:, -self.overlap:] = input_ids[:, actual_pos:actual_pos+self.overlap]
             
             # 执行推理，使用kv_cache
@@ -38,6 +39,8 @@ class ChunkOptimizer:
             
             # 保留最后logits用于后续生成
             if pos == start_pos:
+                next_token_logits = outputs.logits[:, -1, :]
+            elif next_token_logits is None:
                 next_token_logits = outputs.logits[:, -1, :]
         
         return next_token_logits, past_key_values
@@ -68,8 +71,10 @@ class AdaptiveMemoryManager:
     
     def dynamic_chunk_size(self):
         """动态计算分块大小"""
-        free_mem = self.total_mem - torch.cuda.memory_allocated()
-        return int(free_mem // (2 * 1024**2))  # 每MB可存储约2个token
+        # 计算实际可用显存（保留内存 - 已分配内存）
+        free_mem = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+        # 精确估算系数（1.2MB/token包含参数和激活值）
+        return int(free_mem // (1.2 * 1024**2))
 
 def load_longbench_data():
     """加载本地 LongBench-v2 数据集"""
@@ -81,12 +86,17 @@ def load_deepseek_model():
     """加载本地 DeepSeek-R1-Distill-Qwen-1.5B 模型"""
     model_path = 'huggingface_model/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B'
     tokenizer = AutoTokenizer.from_pretrained(model_path)
-    model = AutoModelForCausalLM.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="cuda",
+        torch_dtype=torch.float16,
+        low_cpu_mem_usage=True
+    )
     return model, tokenizer
 
 def initialize_targeted_surprise(d_model=64, n_targets=8):
     """初始化 TargetedSurprise 模块"""
-    return TargetedSurprise(d_model, n_targets)
+    return TargetedSurprise(d_model, n_targets).to("cuda")
 
 def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     """结合 TargetedSurprise 进行推理"""
@@ -98,9 +108,9 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     mem_manager = AdaptiveMemoryManager(torch.cuda.get_device_properties(0).total_memory) if torch.cuda.is_available() else None
     
     # 定义最大序列长度
-    max_seq_length = 8192
+    max_seq_length = 512  # 减小最大序列长度以节省显存
     
-    for item in data[:2]:  # 测试前2个样本
+    for item in data[1:2]:  # 测试第2个样本
         # 准备输入（添加长度检查）
         context = item['context']
         question = item['question']
@@ -114,7 +124,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         input_text = f"Context: {context}\nQuestion: {question}"
         
         # 初始化状态
-        hidden_state = torch.zeros(n_targets, d_model)
+        hidden_state = torch.zeros(n_targets, d_model).to("cuda")
         target_texts = [context]
         
         # 显存监控
@@ -126,13 +136,16 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             print(f"GPU memory: Allocated {allocated_mem / (1024 ** 3):.2f} GB, Free {free_mem / (1024 ** 3):.2f} GB")
         
         # 初始化输入
-        input_ids = tokenizer(input_text, return_tensors="pt", max_length=max_seq_length, truncation=True)['input_ids'].unsqueeze(0)
+        tokenized = tokenizer(input_text, return_tensors="pt", max_length=max_seq_length, truncation=True)
+        input_ids = tokenized['input_ids'].to("cuda")
+        attention_mask = tokenized['attention_mask'].to("cuda")
+        print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
         output_ids = []
         
         # 上下文嵌入缓存
         context_embeddings = model.get_input_embeddings()(input_ids)
         
-        for i in range(512):  # 最大生成长度
+        for i in range(256):  # 减小最大生成长度以节省显存
             # 动态调整分块大小
             if mem_manager:
                 chunk_size = mem_manager.dynamic_chunk_size()
@@ -148,7 +161,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             else:
                 with torch.no_grad():
                     outputs = model(input_ids=input_ids,
-                                 attention_mask=torch.ones_like(input_ids),
+                                 attention_mask=torch.ones(input_ids.shape, dtype=torch.long, device=input_ids.device),
                                  past_key_values=past_key_values)
                     next_token_logits = outputs.logits[:, -1, :]
                     past_key_values = outputs.past_key_values
@@ -160,14 +173,23 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             # 显存清理
             if mem_manager and mem_manager.should_clean_cache():
                 torch.cuda.empty_cache()
-                # 清理过大的past_key_values
-                if past_key_values is not None and len(past_key_values) > 4:  # 保留最近4层
-                    past_key_values = past_key_values[-4:]
+                # 按模型层数清理KV Cache (DeepSeek-R1有32层)
+                if past_key_values is not None:
+                    # 保留最近2层并释放其余层的显存
+                    retained_layers = 2
+                    past_key_values = [(k[-retained_layers:], v[-retained_layers:]) for (k,v) in past_key_values]
+                    # 显式释放被截断层的显存
+                    for i in range(retained_layers, len(past_key_values[0][0])):
+                        del past_key_values[0][0][i]
+                        del past_key_values[0][1][i]
+                    torch.cuda.empty_cache()
             
             # 应用 TargetedSurprise
-            x = tokenizer.decode(input_ids[0], skip_special_tokens=True)
-            x = encoder.encode(x, input_ids[0]).squeeze(-1)  # 确保x是二维张量
-            surprise, hidden_state = targeted_surprise(x.float(), hidden_state, target_texts)
+            # 保持int类型输入，通过嵌入层获取向量
+            # 优化嵌入向量获取，仅处理最后一个token
+            with torch.no_grad():
+                x_emb = model.get_input_embeddings()(input_ids[:, -1:]).to(torch.float16)
+            surprise, hidden_state = targeted_surprise(x_emb.squeeze(0), hidden_state, target_texts)
             
             # 动态更新上下文（差分更新）
             if surprise.abs().max() > 0.5:

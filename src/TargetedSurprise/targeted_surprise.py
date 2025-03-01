@@ -15,17 +15,21 @@ class TargetedSurprise(nn.Module):
         if self.decay_gate is None or self.input_dim != input_dim:
             self.input_dim = input_dim
             self.decay_gate = nn.Sequential(
-                nn.Linear(input_dim, 512),
+                nn.Linear(input_dim, 512).to("cuda"),
                 nn.ReLU(),
-                nn.Linear(512, 1)
+                nn.Linear(512, 1).to("cuda")
             )
         
-    def forward(self, x, position_state, target_texts):
+    def forward(self, x_emb, position_state, target_texts):
         """
-        x: [seq_len, d_model] 输入序列
+        x_emb: [seq_len, d_model] 输入嵌入向量
         position_state: [n_targets, d_model] 位置状态矩阵
         target_texts: List[str] 激活的目标原文
         """
+        # 标准化输入形状和类型
+        x_emb = x_emb.to(torch.float16)
+        if x_emb.dim() == 3:
+            x_emb = x_emb.squeeze(0)
         seq_len, _ = x.shape
         
         # 初始化decay_gate
@@ -50,7 +54,7 @@ class TargetedSurprise(nn.Module):
             # 调整target_queries_normalized维度以匹配输入
             if chunk_normalized.size(1) != target_queries_normalized.size(1):
                 # 如果维度不匹配，使用线性投影对齐
-                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1))
+                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1)).to("cuda")
                 chunk_normalized = projection(chunk_normalized)
                 
             chunk_sim = torch.matmul(chunk_normalized, target_queries_normalized.t())
