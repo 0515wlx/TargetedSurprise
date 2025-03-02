@@ -7,8 +7,9 @@ from src.TargetedSurprise import TargetedSurprise
 
 class ChunkOptimizer:
     """动态分块优化类"""
-    def __init__(self, model, chunk_size=512, overlap=64):
+    def __init__(self, model, tokenizer, chunk_size=512, overlap=64):
         self.model = model
+        self.tokenizer = tokenizer
         self.chunk_size = chunk_size
         self.overlap = overlap
         
@@ -37,12 +38,37 @@ class ChunkOptimizer:
                 outputs = self.model(input_ids=window, past_key_values=past_key_values)
                 past_key_values = outputs.past_key_values
             
-            # 保留最后logits用于后续生成
-            if pos == start_pos:
+            # 确保始终返回有效的logits
+            if outputs.logits is not None:
                 next_token_logits = outputs.logits[:, -1, :]
-            elif next_token_logits is None:
-                next_token_logits = outputs.logits[:, -1, :]
+            else:
+                # 如果logits为None，使用默认值
+                vocab_size = self.model.config.vocab_size
+                next_token_logits = torch.zeros(
+                    (1, vocab_size),
+                    dtype=torch.float32,
+                    device=input_ids.device
+                )
+                # 设置默认token的概率
+                default_token_id = self.tokenizer.eos_token_id or 0
+                next_token_logits[0, default_token_id] = 1.0
         
+        # 确保返回值都不为None
+        if next_token_logits is None:
+            vocab_size = self.model.config.vocab_size
+            next_token_logits = torch.zeros(
+                (1, vocab_size),
+                dtype=torch.float32,
+                device=input_ids.device
+            )
+            # 设置默认token的概率
+            default_token_id = self.tokenizer.eos_token_id or 0
+            next_token_logits[0, default_token_id] = 1.0
+            
+        if past_key_values is None:
+            # 初始化空的past_key_values
+            past_key_values = tuple([(None, None)] * self.model.config.num_hidden_layers)
+            
         return next_token_logits, past_key_values
 
 class IncrementalEncoder:
@@ -88,28 +114,30 @@ def load_deepseek_model():
     tokenizer = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        device_map="cuda",
-        torch_dtype=torch.float16,
+        device_map="cpu",
+        torch_dtype=torch.float32,
         low_cpu_mem_usage=True
     )
     return model, tokenizer
 
 def initialize_targeted_surprise(d_model=64, n_targets=8):
     """初始化 TargetedSurprise 模块"""
-    return TargetedSurprise(d_model, n_targets).to("cuda")
+    return TargetedSurprise(d_model, n_targets).to("cpu")
 
 def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     """结合 TargetedSurprise 进行推理"""
     results = []
     
     # 初始化优化工具
-    chunk_optimizer = ChunkOptimizer(model)
+    chunk_optimizer = ChunkOptimizer(model, tokenizer, chunk_size=32, overlap=16)
     encoder = IncrementalEncoder(tokenizer)
     mem_manager = AdaptiveMemoryManager(torch.cuda.get_device_properties(0).total_memory) if torch.cuda.is_available() else None
     
     # 定义最大序列长度
-    max_seq_length = 128  # 进一步减小最大序列长度以节省显存
+    max_seq_length = 16  # 进一步减小最大序列长度以节省显存
     model.gradient_checkpointing_enable()  # 启用梯度检查点
+    # 使用更小的batch size
+    batch_size = 1
     
     for item in data[1:2]:  # 测试第2个样本
         # 准备输入（添加长度检查）
@@ -125,7 +153,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         input_text = f"Context: {context}\nQuestion: {question}"
         
         # 初始化状态
-        hidden_state = torch.zeros(n_targets, d_model).to("cuda")
+        hidden_state = torch.zeros(n_targets, d_model).to("cpu")
         target_texts = [context]
         
         # 显存监控
@@ -137,16 +165,16 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             print(f"GPU memory: Allocated {allocated_mem / (1024 ** 3):.2f} GB, Free {free_mem / (1024 ** 3):.2f} GB")
         
         # 初始化输入
-        tokenized = tokenizer(input_text, return_tensors="pt", max_length=max_seq_length, truncation=True)
-        input_ids = tokenized['input_ids'].to("cuda")
-        attention_mask = tokenized['attention_mask'].to("cuda")
+        tokenized = tokenizer(input_text, return_tensors="pt", max_length=max_seq_length, truncation=True, padding='max_length')
+        input_ids = tokenized['input_ids'].to("cpu")
+        attention_mask = tokenized['attention_mask'].to("cpu")
         print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
         output_ids = []
         
         # 上下文嵌入缓存
         context_embeddings = model.get_input_embeddings()(input_ids)
         
-        for i in range(256):  # 减小最大生成长度以节省显存
+        for i in range(64):  # 进一步减小最大生成长度以节省显存
             # 动态调整分块大小
             if mem_manager:
                 chunk_size = mem_manager.dynamic_chunk_size()
@@ -190,7 +218,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             # 保持int类型输入，通过嵌入层获取向量
             # 优化嵌入向量获取，仅处理最后一个token
             with torch.no_grad():
-                x_emb = model.get_input_embeddings()(input_ids[:, -1:]).to(torch.float16)
+                x_emb = model.get_input_embeddings()(input_ids[:, -1:]).to("cpu").to(torch.float16)
             surprise, hidden_state = targeted_surprise(x_emb.squeeze(0), hidden_state, target_texts)
             
             # 动态更新上下文（差分更新）
@@ -212,6 +240,10 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     return results
 
 if __name__ == "__main__":
+    # 设置CUDA内存分配策略
+    import os
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+    
     # 加载数据
     dataset = load_longbench_data()
     
@@ -223,8 +255,12 @@ if __name__ == "__main__":
     n_targets = 8
     targeted_surprise = initialize_targeted_surprise(d_model, n_targets)
     
+    # 启用混合精度训练
+    from torch.cuda.amp import autocast
+    
     # 进行推理
-    results = inference_with_targeted_surprise(model, tokenizer, targeted_surprise, dataset)
+    with autocast():
+        results = inference_with_targeted_surprise(model, tokenizer, targeted_surprise, dataset)
     
     # 输出结果
     for result in results:

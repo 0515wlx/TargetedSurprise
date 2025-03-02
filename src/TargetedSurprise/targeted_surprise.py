@@ -15,13 +15,13 @@ class TargetedSurprise(nn.Module):
         if self.decay_gate is None or self.input_dim != input_dim:
             self.input_dim = input_dim
             self.decay_gate = nn.Sequential(
-                nn.Linear(input_dim, 512, dtype=torch.float16).to("cuda"),
+                nn.Linear(input_dim, 512, dtype=torch.float32),
                 nn.ReLU(),
-                nn.Linear(512, 1, dtype=torch.float16).to("cuda")
-            )
-            # 确保所有参数都转换为float16
+                nn.Linear(512, 1, dtype=torch.float32)
+            ).to("cpu")
+            # 保持float32类型
             for param in self.decay_gate.parameters():
-                param.data = param.data.half()
+                param.data = param.data.float()
         
     def forward(self, x_emb, position_state, target_texts):
         """
@@ -30,7 +30,7 @@ class TargetedSurprise(nn.Module):
         target_texts: List[str] 激活的目标原文
         """
         # 标准化输入形状和类型
-        x_emb = x_emb.to(torch.float16)
+        x_emb = x_emb.float()
         if x_emb.dim() == 3:
             x_emb = x_emb.squeeze(0)
         seq_len, _ = x_emb.shape
@@ -46,7 +46,7 @@ class TargetedSurprise(nn.Module):
         sim_chunks = []
         
         # 目标相似度计算（分块处理）
-        target_queries_normalized = (self.target_queries / self.target_queries.norm(dim=1, keepdim=True)).to(torch.float16)
+        target_queries_normalized = (self.target_queries.float() / self.target_queries.norm(dim=1, keepdim=True))
         
         for chunk in chunks:
             # 确保输入维度正确
@@ -57,7 +57,7 @@ class TargetedSurprise(nn.Module):
             # 调整target_queries_normalized维度以匹配输入
             if chunk_normalized.size(1) != target_queries_normalized.size(1):
                 # 如果维度不匹配，使用线性投影对齐
-                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1), dtype=torch.float16).to("cuda")
+                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1), dtype=torch.float32).to("cpu")
                 chunk_normalized = projection(chunk_normalized)
                 
             chunk_sim = torch.matmul(chunk_normalized, target_queries_normalized.t())
