@@ -108,7 +108,8 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     mem_manager = AdaptiveMemoryManager(torch.cuda.get_device_properties(0).total_memory) if torch.cuda.is_available() else None
     
     # 定义最大序列长度
-    max_seq_length = 512  # 减小最大序列长度以节省显存
+    max_seq_length = 128  # 进一步减小最大序列长度以节省显存
+    model.gradient_checkpointing_enable()  # 启用梯度检查点
     
     for item in data[1:2]:  # 测试第2个样本
         # 准备输入（添加长度检查）
@@ -162,7 +163,8 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
                 with torch.no_grad():
                     outputs = model(input_ids=input_ids,
                                  attention_mask=torch.ones(input_ids.shape, dtype=torch.long, device=input_ids.device),
-                                 past_key_values=past_key_values)
+                                 past_key_values=tuple(past_key_values) if past_key_values else None,
+                                 use_cache=True)
                     next_token_logits = outputs.logits[:, -1, :]
                     past_key_values = outputs.past_key_values
             

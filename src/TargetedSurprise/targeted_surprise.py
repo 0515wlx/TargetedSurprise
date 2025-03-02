@@ -15,10 +15,13 @@ class TargetedSurprise(nn.Module):
         if self.decay_gate is None or self.input_dim != input_dim:
             self.input_dim = input_dim
             self.decay_gate = nn.Sequential(
-                nn.Linear(input_dim, 512).to("cuda"),
+                nn.Linear(input_dim, 512, dtype=torch.float16).to("cuda"),
                 nn.ReLU(),
-                nn.Linear(512, 1).to("cuda")
+                nn.Linear(512, 1, dtype=torch.float16).to("cuda")
             )
+            # 确保所有参数都转换为float16
+            for param in self.decay_gate.parameters():
+                param.data = param.data.half()
         
     def forward(self, x_emb, position_state, target_texts):
         """
@@ -30,20 +33,20 @@ class TargetedSurprise(nn.Module):
         x_emb = x_emb.to(torch.float16)
         if x_emb.dim() == 3:
             x_emb = x_emb.squeeze(0)
-        seq_len, _ = x.shape
+        seq_len, _ = x_emb.shape
         
         # 初始化decay_gate
-        if x.dim() == 1:
-            x = x.unsqueeze(0)
-        self._init_decay_gate(x.size(1))
+        if x_emb.dim() == 1:
+            x_emb = x_emb.unsqueeze(0)
+        self._init_decay_gate(x_emb.size(1))
         
         # 分块处理设置
         max_chunk_size = 4096  # 每个分块最大长度
-        chunks = torch.split(x, max_chunk_size, dim=0)
+        chunks = torch.split(x_emb, max_chunk_size, dim=0)
         sim_chunks = []
         
         # 目标相似度计算（分块处理）
-        target_queries_normalized = self.target_queries / self.target_queries.norm(dim=1, keepdim=True)
+        target_queries_normalized = (self.target_queries / self.target_queries.norm(dim=1, keepdim=True)).to(torch.float16)
         
         for chunk in chunks:
             # 确保输入维度正确
@@ -54,7 +57,7 @@ class TargetedSurprise(nn.Module):
             # 调整target_queries_normalized维度以匹配输入
             if chunk_normalized.size(1) != target_queries_normalized.size(1):
                 # 如果维度不匹配，使用线性投影对齐
-                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1)).to("cuda")
+                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1), dtype=torch.float16).to("cuda")
                 chunk_normalized = projection(chunk_normalized)
                 
             chunk_sim = torch.matmul(chunk_normalized, target_queries_normalized.t())
