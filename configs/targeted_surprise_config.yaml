@@ -1,6 +1,8 @@
 # TargetedSurprise 模型配置
 model:
   d_model: 64  # 模型维度
+  use_sliding_window: true  # 启用滑动窗口机制
+  sliding_window_size: 4096 # 窗口大小与模型配置同步
   n_targets: 8  # 目标数量
   decay_threshold: 0.95  # 衰减阈值
   surprise_threshold: 0.5  # 惊喜检测阈值

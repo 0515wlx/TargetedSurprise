@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from transformers.cache_utils import DynamicCache
 
 class TargetedSurprise(nn.Module):
     def __init__(self, d_model, n_targets):
@@ -41,8 +42,15 @@ class TargetedSurprise(nn.Module):
         self._init_decay_gate(x_emb.size(1))
         
         # 分块处理设置
-        max_chunk_size = 4096  # 每个分块最大长度
-        chunks = torch.split(x_emb, max_chunk_size, dim=0)
+        # 动态获取模型的实际窗口大小
+        window_size = getattr(self.model.config, "sliding_window", 4096)
+        # 使用模型自带的缓存管理
+        if past_key_values is not None and window_size > 0:
+            past_key_values = self._truncate_cache(past_key_values, window_size)
+        # 生成符合窗口大小的注意力掩码
+        attention_mask = self._create_sliding_window_mask(x_emb.size(0), window_size)
+        # 分块处理设置
+        chunks = x_emb.split(window_size, dim=0)
         sim_chunks = []
         
         # 目标相似度计算（分块处理）
@@ -72,6 +80,21 @@ class TargetedSurprise(nn.Module):
             alpha_chunks.append(chunk_alpha)
         alpha = torch.cat(alpha_chunks, dim=0)  # [seq_len, 1]
         
+        # 缓存截断（确保不超过窗口大小）
+        # 严格保持缓存对象类型（使用DynamicCache接口）
+        if past_key_values is not None and window_size > 0:
+            # 创建新的DynamicCache实例
+            new_cache = DynamicCache()
+            # 逐层复制并截断缓存
+            for layer_idx in range(len(past_key_values)):
+                key_states, value_states = past_key_values[layer_idx]
+                new_cache.update(
+                    key_states[..., -window_size:, :],
+                    value_states[..., -window_size:, :],
+                    layer_idx,
+                )
+            past_key_values = new_cache
+
         # 显存监控与自动调整
         if torch.cuda.is_available():
             total_mem = torch.cuda.get_device_properties(0).total_memory
