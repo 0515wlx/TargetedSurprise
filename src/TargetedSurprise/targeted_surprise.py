@@ -7,11 +7,26 @@ class TargetedSurprise(nn.Module):
         super().__init__()
         # 可学习的目标查询向量
         self.target_queries = nn.Parameter(torch.randn(n_targets, d_model))
+        # 初始化decay_gate相关属性
+        self.decay_gate = None
+        self.input_dim = None
+        
+    def _create_sliding_window_mask(self, seq_len, window_size):
+        """创建滑动窗口注意力掩码"""
+        # 创建全1矩阵
+        mask = torch.ones(seq_len, seq_len, dtype=torch.bool)
+        # 设置滑动窗口
+        for i in range(seq_len):
+            start = max(0, i - window_size + 1)
+            end = i + 1
+            mask[i, :start] = 0
+            mask[i, end:] = 0
+        return mask
         # 动态衰减系数生成器（延迟初始化）
         self.decay_gate = None
         self.input_dim = None
         
-    def _init_decay_gate(self, input_dim):
+    def _init_decay_gate(self, input_dim, device):
         """根据输入维度初始化decay_gate"""
         if self.decay_gate is None or self.input_dim != input_dim:
             self.input_dim = input_dim
@@ -19,7 +34,7 @@ class TargetedSurprise(nn.Module):
                 nn.Linear(input_dim, 512, dtype=torch.float32),
                 nn.ReLU(),
                 nn.Linear(512, 1, dtype=torch.float32)
-            ).to("cpu")
+            ).to(device)
             # 保持float32类型
             for param in self.decay_gate.parameters():
                 param.data = param.data.float()
@@ -39,11 +54,13 @@ class TargetedSurprise(nn.Module):
         # 初始化decay_gate
         if x_emb.dim() == 1:
             x_emb = x_emb.unsqueeze(0)
-        self._init_decay_gate(x_emb.size(1))
+        self._init_decay_gate(x_emb.size(1), x_emb.device)
         
         # 分块处理设置
-        # 动态获取模型的实际窗口大小
-        window_size = getattr(self.model.config, "sliding_window", 4096)
+        # 使用固定窗口大小
+        window_size = 4096
+        # 初始化缓存
+        past_key_values = None
         # 使用模型自带的缓存管理
         if past_key_values is not None and window_size > 0:
             past_key_values = self._truncate_cache(past_key_values, window_size)
@@ -65,7 +82,7 @@ class TargetedSurprise(nn.Module):
             # 调整target_queries_normalized维度以匹配输入
             if chunk_normalized.size(1) != target_queries_normalized.size(1):
                 # 如果维度不匹配，使用线性投影对齐
-                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1), dtype=torch.float32).to("cpu")
+                projection = nn.Linear(chunk_normalized.size(1), target_queries_normalized.size(1), dtype=torch.float32).to(x_emb.device)
                 chunk_normalized = projection(chunk_normalized)
                 
             chunk_sim = torch.matmul(chunk_normalized, target_queries_normalized.t())
@@ -116,6 +133,7 @@ class TargetedSurprise(nn.Module):
         for i, chunk in enumerate(chunks):
             chunk_sim = sim_chunks[i]
             chunk_alpha = alpha_chunks[i]
+            max_chunk_size = window_size
             chunk_core_mask = core_mask[i*max_chunk_size:(i+1)*max_chunk_size]
             
             chunk_surprise = (chunk_sim.unsqueeze(-1) * chunk_alpha.unsqueeze(1) * chunk_core_mask.unsqueeze(1)) - \

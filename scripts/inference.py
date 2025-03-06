@@ -6,88 +6,6 @@ import transformers
 sys.path.append('.')  # 添加项目根目录到 Python 路径
 from src.TargetedSurprise import TargetedSurprise
 
-class ChunkOptimizer:
-    """动态分块优化类"""
-    def __init__(self, model, tokenizer, chunk_size=512, overlap=64):
-        self.model = model
-        self.tokenizer = tokenizer
-        self.chunk_size = chunk_size
-        self.overlap = overlap
-        
-    def process_chunks(self, input_ids, past_key_values=None, max_cache_size=4096):
-        """使用环形缓冲区实现滑动窗口分块，支持kv_cache"""
-        next_token_logits = None
-        seq_len = input_ids.size(1)
-        window = torch.zeros((1, self.chunk_size), dtype=torch.long, device=input_ids.device)
-        
-        # 使用StaticCache初始化缓存
-        if past_key_values is None:
-            past_key_values = StaticCache(
-                batch_size=1,
-                max_batch_size=1,
-                max_cache_len=self.model.config.max_position_embeddings,
-                num_heads=self.model.config.num_attention_heads,
-                head_dim=self.model.config.hidden_size // self.model.config.num_attention_heads,
-                device=input_ids.device,
-                dtype=torch.float16 if input_ids.device.type == "cuda" else torch.float32
-            )
-        
-        # 初始化窗口
-        start_pos = max(0, seq_len - self.chunk_size)
-        window[:, :input_ids.size(1)-start_pos].copy_(input_ids[:, start_pos:])
-        
-        # 逆向滑动处理
-        for pos in range(seq_len - self.chunk_size, -self.chunk_size, -self.chunk_size):
-            actual_pos = max(0, pos)
-            actual_end = actual_pos + self.chunk_size
-            
-            # 更新窗口内容
-            if pos != start_pos:
-                window[:, :-self.overlap] = window[:, self.overlap:].clone()
-                window[:, -self.overlap:] = input_ids[:, actual_pos:actual_pos+self.overlap]
-            
-            # 执行推理，使用kv_cache
-            with torch.no_grad():
-                # 更新缓存
-                outputs = self.model(input_ids=window, past_key_values=past_key_values, use_cache=True)
-                
-                # 更新缓存
-                past_key_values = outputs.past_key_values
-                # StaticCache会自动管理缓存大小，无需手动截断
-            
-            # 确保始终返回有效的logits
-            if outputs.logits is not None:
-                next_token_logits = outputs.logits[:, -1, :]
-            else:
-                # 如果logits为None，使用默认值
-                vocab_size = self.model.config.vocab_size
-                next_token_logits = torch.zeros(
-                    (1, vocab_size),
-                    dtype=torch.float32,
-                    device=input_ids.device
-                )
-                # 设置默认token的概率
-                default_token_id = self.tokenizer.eos_token_id or 0
-                next_token_logits[0, default_token_id] = 1.0
-        
-        # 确保返回值都不为None
-        if next_token_logits is None:
-            vocab_size = self.model.config.vocab_size
-            next_token_logits = torch.zeros(
-                (1, vocab_size),
-                dtype=torch.float32,
-                device=input_ids.device
-            )
-            # 设置默认token的概率
-            default_token_id = self.tokenizer.eos_token_id or 0
-            next_token_logits[0, default_token_id] = 1.0
-            
-        if past_key_values is None:
-            # 初始化空的past_key_values
-            past_key_values = tuple([(None, None)] * self.model.config.num_hidden_layers)
-            
-        return next_token_logits, past_key_values
-
 class IncrementalEncoder:
     """增量编码优化类"""
     def __init__(self, tokenizer):
@@ -100,26 +18,6 @@ class IncrementalEncoder:
         new_ids = self.tokenizer.encode(new_text, add_special_tokens=False)
         # 将一维张量转换为二维张量 [seq_len, 1]
         return torch.cat([prev_ids, torch.tensor(new_ids)], dim=-1).unsqueeze(-1)
-
-class AdaptiveMemoryManager:
-    """自适应显存管理类"""
-    def __init__(self, total_mem):
-        self.total_mem = total_mem
-        self.safety_margin = 0.2  # 20%安全余量
-        
-    def should_clean_cache(self):
-        """判断是否需要清理缓存"""
-        used = torch.cuda.memory_allocated()
-        return used > self.total_mem * (1 - self.safety_margin)
-    
-    def dynamic_chunk_size(self):
-        """动态计算分块大小"""
-        # 计算实际可用显存（保留内存 - 已分配内存）
-        free_mem = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
-        # 精确估算系数（1.2MB/token包含参数和激活值）
-        chunk_size = int(free_mem // (1.2 * 1024**2))
-        # 确保最小分块大小为512
-        return max(512, chunk_size)
 
 def load_longbench_data():
     """加载本地 LongBench-v2 数据集"""
@@ -136,7 +34,7 @@ def load_deepseek_model():
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         device_map="auto",
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
+        torch_dtype=torch.float32,  # 强制使用float32
         low_cpu_mem_usage=True,
         offload_folder="offload",
         offload_state_dict=True,
@@ -153,20 +51,22 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     results = []
     
     # 初始化优化工具
-    chunk_optimizer = ChunkOptimizer(model, tokenizer, chunk_size=512, overlap=64)
     encoder = IncrementalEncoder(tokenizer)
-    mem_manager = AdaptiveMemoryManager(torch.cuda.get_device_properties(0).total_memory) if torch.cuda.is_available() else None
     
     # 定义最大序列长度
     max_seq_length = 2048  # 增大序列长度保证完整上下文
     # 禁用梯度检查点，推理模式下不需要
     # 配置生成参数
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+         
     generation_config = {
         "eos_token_id": tokenizer.eos_token_id,
-        "pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id,
-        "max_new_tokens": 256,
+        "pad_token_id": tokenizer.pad_token_id,
+        "max_new_tokens": 128,  # 减少生成token数量
         "temperature": 0.7,
-        "top_p": 0.9
+        "top_p": 0.9,
+        "max_length": 1024  # 限制最大序列长度
     }
     
     for item in data[1:2]:  # 测试第2个样本
@@ -199,62 +99,38 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         input_ids = tokenized['input_ids'].to(model.device)
         attention_mask = tokenized['attention_mask'].to(model.device)
         print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
+        print(f"Input IDs: {input_ids}")
+        print(f"Attention mask: {attention_mask}")
         output_ids = []
         
         # 上下文嵌入缓存
         context_embeddings = model.get_input_embeddings()(input_ids)
         
-        for i in range(generation_config["max_new_tokens"]):  # 使用动态生成长度
-            # 动态调整分块大小
-            if mem_manager:
-                chunk_size = mem_manager.dynamic_chunk_size()
-                chunk_optimizer.chunk_size = chunk_size
+        # 使用model.generate()进行完整推理
+        with torch.no_grad():
+            # 先运行一次forward获取logits
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            print(f"Logits shape: {logits.shape}")
+            print(f"Logits min: {logits.min().item()}, max: {logits.max().item()}")
+            print(f"Logits contains NaN: {torch.isnan(logits).any().item()}")
+            print(f"Logits contains Inf: {torch.isinf(logits).any().item()}")
             
-            # 初始化Cache
-            if i == 0:
-                # 使用StaticCache初始化缓存
-                past_key_values = StaticCache(
-                    batch_size=1,
-                    max_batch_size=1,
-                    max_cache_len=model.config.max_position_embeddings,
-                    num_heads=model.config.num_attention_heads,
-                    head_dim=model.config.hidden_size // model.config.num_attention_heads,
-                    device=model.device,
-                    dtype=torch.float16 if model.device.type == "cuda" else torch.float32
-                )
+            # 生成输出
+            outputs = model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=generation_config["max_new_tokens"],
+                temperature=generation_config["temperature"],
+                top_p=generation_config["top_p"],
+                do_sample=True,
+                use_cache=True,
+                eos_token_id=tokenizer.eos_token_id,
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id
+            )
+            output_ids = outputs[0].tolist()
             
-            # 检查序列长度，必要时分块处理
-            if input_ids.shape[1] > max_seq_length:
-                next_token_logits, past_key_values = chunk_optimizer.process_chunks(
-                    input_ids,
-                    past_key_values,
-                    max_cache_size=model.config.max_position_embeddings  # 使用模型支持的最大长度
-                )
-            else:
-                with torch.no_grad():
-                    outputs = model(input_ids=input_ids,
-                                 attention_mask=torch.ones(input_ids.shape, dtype=torch.long, device=input_ids.device),
-                                 past_key_values=past_key_values,
-                                 use_cache=True)
-                    next_token_logits = outputs.logits[:, -1, :]
-                    past_key_values = outputs.past_key_values
-            
-            next_token = torch.argmax(next_token_logits, dim=-1)
-            # 检测EOS token提前停止
-            if next_token.item() == tokenizer.eos_token_id:
-                break
-            output_ids.append(next_token.item())
-            # 更新输入时保留attention_mask
-            # 确保input_ids和next_token维度一致
-            next_token = next_token.unsqueeze(0)
-            input_ids = torch.cat([input_ids, next_token], dim=-1)
-            attention_mask = torch.cat([attention_mask, torch.ones((1, 1), dtype=torch.long, device=attention_mask.device)], dim=1)
-            attention_mask = torch.cat([attention_mask, torch.ones((1, 1), dtype=torch.long, device=attention_mask.device)], dim=1)
-            
-            # 显存清理
-            if mem_manager and mem_manager.should_clean_cache():
-                torch.cuda.empty_cache()
-                # StaticCache会自动管理显存，无需手动清理
+            # StaticCache会自动管理显存，无需手动清理
             
             # 应用 TargetedSurprise
             # 保持int类型输入，通过嵌入层获取向量
