@@ -39,8 +39,7 @@ def load_deepseek_model():
         torch_dtype=torch.float32,  # 强制使用float32
         low_cpu_mem_usage=True,
         offload_folder="offload",
-        offload_state_dict=True,
-        attn_implementation="eager"  # 强制使用eager模式
+        offload_state_dict=True
     ).eval().to(device)
     return model, tokenizer
 
@@ -102,7 +101,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         question = item['question']
         
         # 动态截断上下文
-        max_context_length = 16384  # 最大上下文长度
+        max_context_length = 8192  # 最大上下文长度
         if len(context) > max_context_length:
             context = context[:max_context_length]
             print(f"Warning: Context truncated to {max_context_length} tokens")
@@ -214,10 +213,6 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     return results
 
 if __name__ == "__main__":
-    # 设置CUDA内存分配策略
-    import os
-    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
-    
     # 加载数据
     dataset = load_longbench_data()
     

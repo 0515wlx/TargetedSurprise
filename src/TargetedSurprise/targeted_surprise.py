@@ -7,9 +7,13 @@ class TargetedSurprise(nn.Module):
         super().__init__()
         # 可学习的目标查询向量
         self.target_queries = nn.Parameter(torch.randn(n_targets, d_model))
-        # 初始化decay_gate相关属性
-        self.decay_gate = None
-        self.input_dim = None
+        # 初始化decay_gate
+        self.input_dim = d_model
+        self.decay_gate = nn.Sequential(
+            nn.Linear(d_model, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1)
+        )
         
     def _create_sliding_window_mask(self, seq_len, window_size):
         """创建滑动窗口注意力掩码"""
@@ -152,4 +156,6 @@ class TargetedSurprise(nn.Module):
         # 记忆更新规则
         new_hidden = position_state.squeeze(0) + target_surprise.mean(dim=0) 
         
-        return target_surprise.squeeze(-1), new_hidden
+        # 调整输出形状为 [seq_len, n_targets]
+        target_surprise = target_surprise.mean(dim=-1)  # 对最后一个维度取平均
+        return target_surprise, new_hidden

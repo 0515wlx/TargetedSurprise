@@ -26,8 +26,8 @@ class TestTargetedSurprise(unittest.TestCase):
         # 验证参数初始化
         self.assertEqual(self.model.target_queries.shape, 
                         (self.n_targets, self.d_model))
-        self.assertEqual(self.model.decay_gate.in_features, self.d_model)
-        self.assertEqual(self.model.decay_gate.out_features, 1)
+        self.assertEqual(self.model.decay_gate[0].in_features, self.d_model)
+        self.assertEqual(self.model.decay_gate[-1].out_features, 1)
 
 if __name__ == '__main__':
     unittest.main()
