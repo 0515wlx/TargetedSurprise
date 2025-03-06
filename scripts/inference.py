@@ -1,6 +1,8 @@
 import sys
 import json
+import re
 import torch
+from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM, StaticCache
 import transformers
 sys.path.append('.')  # 添加项目根目录到 Python 路径
@@ -63,13 +65,38 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     generation_config = {
         "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
-        "max_new_tokens": 128,  # 减少生成token数量
-        "temperature": 0.7,
+        "max_new_tokens": 256,  # 增加生成token数量以支持完整推理
+        "temperature": 0.3,  # 降低temperature以获得更稳定的输出
         "top_p": 0.9,
-        "max_length": 1024  # 限制最大序列长度
+        "top_k": 50,  # 增加top_k以增强多样性
+        "do_sample": True,
+        "repetition_penalty": 1.2,  # 防止重复
+        "max_length": 2048  # 增加最大序列长度
     }
     
-    for item in data[1:2]:  # 测试第2个样本
+    # 初始化进度条
+    pbar = tqdm(data[1:2], desc="Processing", unit="sample")
+    
+    def get_gpu_memory():
+        if torch.cuda.is_available():
+            total = torch.cuda.get_device_properties(0).total_memory
+            allocated = torch.cuda.memory_allocated()
+            reserved = torch.cuda.memory_reserved()
+            return {
+                'total': total / (1024 ** 3),
+                'allocated': allocated / (1024 ** 3),
+                'reserved': reserved / (1024 ** 3)
+            }
+        return None
+    
+    for item in pbar:  # 测试第2个样本
+        # 更新进度条显示GPU内存信息
+        gpu_mem = get_gpu_memory()
+        if gpu_mem:
+            pbar.set_postfix({
+                'GPU Alloc': f"{gpu_mem['allocated']:.2f}GB",
+                'GPU Resv': f"{gpu_mem['reserved']:.2f}GB"
+            })
         # 准备输入（添加长度检查）
         context = item['context']
         question = item['question']
@@ -80,7 +107,12 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             context = context[:max_context_length]
             print(f"Warning: Context truncated to {max_context_length} tokens")
             
-        input_text = f"Context: {context}\nQuestion: {question}"
+        # 构建新提示
+        choices = [item[k] for k in ['choice_A','choice_B','choice_C','choice_D']]
+        prompt = f"[INST]根据上下文回答选择题：\n上下文：{context}\n问题：{question}\n选项：\n"
+        prompt += "\n".join(f"{chr(65+i)}. {c}" for i,c in enumerate(choices))
+        prompt += "\n请逐步分析后给出最终答案，格式为：答案：X [/INST]"
+        input_text = prompt
         
         # 初始化状态
         hidden_state = torch.zeros(n_targets, d_model).to(model.device)
@@ -145,19 +177,37 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
                 new_embeddings = model.get_input_embeddings()(input_ids[:, -1:])
                 context_embeddings = torch.cat([context_embeddings, new_embeddings], dim=1)
         
-        model_output = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-        # 后处理：清理多余空格和换行符
-        model_output = ' '.join(model_output.split()).replace('\n', ' ')
+        # 解码并清理模型输出
+        model_output = tokenizer.decode(
+            output_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=True
+        ).strip()
         
-        # 存储结果
+        # 提取答案
+        def extract_answer(text):
+            match = re.search(r'答案：([ABCD])', text)
+            return match.group(1) if match else None
+            
+        predicted_answer = extract_answer(model_output)
+        if not predicted_answer:
+            print(f"警告：未检测到有效答案格式 - {model_output}")
+            predicted_answer = "N/A"
+        
+        # 计算surprise score
         if 'surprise' in locals():
             surprise_score = surprise.mean().item() if surprise is not None else 0.0
         else:
             surprise_score = 0.0
             
+        # 存储完整结果
         results.append({
             'question': question,
+            'choices': [item[k] for k in ['choice_A','choice_B','choice_C','choice_D']],
             'model_output': model_output,
+            'predicted_answer': predicted_answer,
+            'correct_answer': item['answer'],
+            'is_correct': predicted_answer == item['answer'],
             'surprise_score': surprise_score
         })
     
