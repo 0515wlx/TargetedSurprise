@@ -115,7 +115,15 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         
         # 初始化状态
         hidden_state = torch.zeros(n_targets, d_model).to(model.device)
-        target_texts = [context]
+        # 使用问题和选项作为目标文本，确保长度为8
+        target_texts = [
+            context[:512],  # 上下文前512字符
+            question,
+            *choices[:6]  # 最多6个选项
+        ]
+        # 如果不足8个，用空字符串填充
+        while len(target_texts) < 8:
+            target_texts.append("")
         
         # 显存监控
         if torch.cuda.is_available():
