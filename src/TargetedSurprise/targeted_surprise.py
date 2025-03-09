@@ -1,13 +1,49 @@
 import torch
 import torch.nn as nn
 from transformers.cache_utils import DynamicCache
+from sklearn.feature_extraction.text import TfidfVectorizer
+import jieba
 
 class TargetedSurprise(nn.Module):
-    def __init__(self, d_model, n_targets):
+    def __init__(self, d_model, max_targets):
         super().__init__()
-        self.d_model = d_model
         # 可学习的目标查询向量
-        self.target_queries = nn.Parameter(torch.randn(n_targets, d_model))
+        self.target_queries = nn.Parameter(torch.randn(max_targets, d_model))
+        
+        self.d_model = d_model
+        self.max_targets = max_targets  # 最大目标数
+        
+        # 初始化TF-IDF分析器
+        self.tfidf = TfidfVectorizer(
+            max_features=512,
+            tokenizer=jieba.cut,
+            stop_words=['的','是','在','和','了','有']
+        )
+        
+        # 初始化上下文记忆
+        self.context_memory = nn.Parameter(torch.zeros(max_targets, d_model))
+        
+        # 初始化decay_gate
+        self.decay_gate = None
+        self.input_dim = None
+        
+    def tfidf_analysis(self, text, max_keywords=8):
+        """使用TF-IDF提取关键词"""
+        # 分词并计算TF-IDF
+        tfidf_matrix = self.tfidf.fit_transform([text])
+        feature_names = self.tfidf.get_feature_names_out()
+        
+        # 获取TF-IDF权重
+        tfidf_scores = tfidf_matrix.toarray()[0]
+        
+        # 按权重排序并选择前max_keywords个关键词
+        sorted_indices = tfidf_scores.argsort()[::-1]
+        keywords = [feature_names[i] for i in sorted_indices[:max_keywords]]
+        
+        return keywords
+        
+        # 可学习的目标查询向量
+        self.register_parameter('target_queries', nn.Parameter(torch.randn(max_targets, d_model)))
         # 初始化decay_gate
         self.input_dim = d_model
         self.decay_gate = nn.Sequential(
@@ -57,16 +93,27 @@ class TargetedSurprise(nn.Module):
         seq_len, _ = x_emb.shape
         
         # 目标文本编码
+        # 使用TF-IDF分析更新目标文本
+        active_targets = []
+        for text in target_texts:
+            keywords = self.tfidf_analysis(text)
+            active_targets.extend(keywords)
+        
+        # 动态调整目标数量
+        active_targets = active_targets[:self.max_targets]
+        self.n_targets = len(active_targets)
+        
+        # 更新目标编码
         target_embeddings = []
-        for text in target_texts[:self.target_queries.size(0)]:  # 确保不超过n_targets
-            # 使用目标查询向量作为基础
-            idx = len(target_embeddings)
-            embedding = self.target_queries[idx].clone()
-            # 添加文本特征
-            words = text.split()
-            for i, word in enumerate(words[:self.d_model//2]):  # 使用前d_model/2个词
-                embedding[i*2] = len(word)  # 词长特征
-                embedding[i*2+1] = hash(word) % 100  # 简单哈希特征
+        for i, keyword in enumerate(active_targets):
+            embedding = self.target_queries[i].clone()
+            # 将关键词特征编码到embedding
+            chars = list(keyword)
+            for j in range(min(len(chars), self.d_model//2)):
+                embedding[j*2] = len(chars[j])  # 字符长度特征
+                embedding[j*2+1] = hash(chars[j]) % 100  # 哈希特征
+            # 更新上下文记忆
+            self.context_memory[i] = embedding.detach()
             target_embeddings.append(embedding)
         
         # 将目标文本编码转换为tensor

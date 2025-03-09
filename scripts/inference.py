@@ -43,9 +43,9 @@ def load_deepseek_model():
     ).eval().to(device)
     return model, tokenizer
 
-def initialize_targeted_surprise(d_model=64, n_targets=8):
+def initialize_targeted_surprise(d_model=64, max_targets=8):
     """初始化 TargetedSurprise 模块"""
-    return TargetedSurprise(d_model, n_targets).to(model.device)
+    return TargetedSurprise(d_model, max_targets).to(model.device)
 
 def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     """结合 TargetedSurprise 进行推理"""
@@ -114,16 +114,14 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         input_text = prompt
         
         # 初始化状态
-        hidden_state = torch.zeros(n_targets, d_model).to(model.device)
-        # 使用问题和选项作为目标文本，确保长度为8
-        target_texts = [
-            context[:512],  # 上下文前512字符
-            question,
-            *choices[:6]  # 最多6个选项
-        ]
-        # 如果不足8个，用空字符串填充
-        while len(target_texts) < 8:
-            target_texts.append("")
+        hidden_state = torch.zeros(max_targets, d_model).to(model.device)
+        # 使用问题和选项作为目标文本，确保长度不超过最大目标数
+        # 使用TF-IDF动态生成目标文本
+        target_texts = targeted_surprise.tfidf_analysis(context, max_keywords=targeted_surprise.max_targets)
+        # 添加问题和选项
+        target_texts.extend([question] + choices)
+        # 截断到最大目标数
+        target_texts = target_texts[:targeted_surprise.max_targets]
         
         # 显存监控
         if torch.cuda.is_available():
@@ -229,8 +227,8 @@ if __name__ == "__main__":
     
     # 初始化 TargetedSurprise
     d_model = 64
-    n_targets = 8
-    targeted_surprise = initialize_targeted_surprise(d_model, n_targets)
+    max_targets = 8
+    targeted_surprise = initialize_targeted_surprise(d_model, max_targets)
     
     # 启用混合精度训练
     from torch.cuda.amp import autocast
