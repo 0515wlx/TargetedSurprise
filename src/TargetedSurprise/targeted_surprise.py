@@ -44,15 +44,7 @@ class TargetedSurprise(nn.Module):
         
         return keywords
         
-        # 可学习的目标查询向量
-        self.register_parameter('target_queries', nn.Parameter(torch.randn(max_targets, d_model)))
-        # 初始化decay_gate
-        self.input_dim = d_model
-        self.decay_gate = nn.Sequential(
-            nn.Linear(d_model, 512),
-            nn.ReLU(),
-            nn.Linear(512, 1)
-        )
+        # 删除重复的参数注册代码
         
     def _create_sliding_window_mask(self, seq_len, window_size):
         """创建滑动窗口注意力掩码"""

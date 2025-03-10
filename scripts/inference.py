@@ -15,11 +15,30 @@ class IncrementalEncoder:
         self.cache = {}
         
     def encode(self, text, prev_ids):
-        """增量编码实现"""
-        new_text = text[len(self.tokenizer.decode(prev_ids)):]
+        """增量编码实现（改进版）"""
+        # 初始化processed_chars（如果不存在）
+        if not hasattr(self, 'processed_chars'):
+            self.processed_chars = 0
+            
+        # 获取新增文本（考虑可能的删除操作）
+        new_text = text[self.processed_chars:]
+        
+        # 编码新文本并更新处理进度
         new_ids = self.tokenizer.encode(new_text, add_special_tokens=False)
-        # 将一维张量转换为二维张量 [seq_len, 1]
-        return torch.cat([prev_ids, torch.tensor(new_ids)], dim=-1).unsqueeze(-1)
+        self.processed_chars += len(new_text)  # 更新已处理字符数
+        
+        # 处理可能的删除操作：当检测到文本缩短时重置进度
+        if len(text) < self.processed_chars:
+            self.processed_chars = len(text)
+            new_text = text[self.processed_chars:]
+            new_ids = self.tokenizer.encode(new_text, add_special_tokens=False)
+            self.processed_chars += len(new_text)
+            
+        # 转换张量形状并拼接
+        new_ids_tensor = torch.tensor(new_ids).to(prev_ids.device)
+        if prev_ids.dim() == 1:
+            prev_ids = prev_ids.unsqueeze(-1)
+        return torch.cat([prev_ids, new_ids_tensor.unsqueeze(-1)], dim=0)
 
 def load_longbench_data():
     """加载本地 LongBench-v2 数据集"""
@@ -65,7 +84,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         "eos_token_id": tokenizer.eos_token_id,
         "pad_token_id": tokenizer.pad_token_id,
         "max_new_tokens": 256,  # 增加生成token数量以支持完整推理
-        "temperature": 0.3,  # 降低temperature以获得更稳定的输出
+        "temperature": 0.6,  # 根据DeepSeek推荐设置为0.6
         "top_p": 0.9,
         "top_k": 50,  # 增加top_k以增强多样性
         "do_sample": True,
@@ -74,7 +93,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     }
     
     # 初始化进度条
-    pbar = tqdm(data, desc="Processing", unit="sample")
+    pbar = tqdm(data[3:4], desc="Processing", unit="sample")
     
     def get_gpu_memory():
         if torch.cuda.is_available():
@@ -110,7 +129,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         choices = [item[k] for k in ['choice_A','choice_B','choice_C','choice_D']]
         prompt = f"[INST]根据上下文回答选择题：\n上下文：{context}\n问题：{question}\n选项：\n"
         prompt += "\n".join(f"{chr(65+i)}. {c}" for i,c in enumerate(choices))
-        prompt += "\n请逐步分析后给出最终答案，格式为：答案：X [/INST]"
+        prompt += "\n请用<think>标签包裹你的思考过程，并在最后给出答案，格式为：\n<think>\n...\n</think>\n答案：X [/INST]"
         input_text = prompt
         
         # 初始化状态
@@ -159,6 +178,9 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             # print(f"Logits contains Inf: {torch.isinf(logits).any().item()}")
             
             # 生成输出
+            # 获取<think>的token id
+            think_token_id = tokenizer.encode("<think>", add_special_tokens=False)[0]
+            
             outputs = model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
@@ -168,7 +190,8 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
                 do_sample=True,
                 use_cache=True,
                 eos_token_id=tokenizer.eos_token_id,
-                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id
+                pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+                # forced_bos_token_id=think_token_id  # 移除强制开始符号
             )
             output_ids = outputs[0].tolist()
             
@@ -199,8 +222,27 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         
         # 提取答案
         def extract_answer(text):
-            match = re.search(r'答案：([ABCD])', text)
-            return match.group(1) if match else None
+            # 增强版答案提取，处理更多格式情况
+            think_match = re.search(r'<think>(.*?)</think>', text, re.DOTALL|re.IGNORECASE)
+            answer_part = text[think_match.end():] if think_match else text
+            
+            # 尝试多种匹配模式
+            patterns = [
+                r'答案\s*[:：]\s*([ABCD])',        # 标准格式
+                r'[\(（]([ABCD])[\)）]',           # 括号格式
+                r'\n\s*([ABCD])\s*\n',            # 独立行格式
+                r'最终答案\s*[:：]\s*([ABCD])',    # 明确标注格式
+                r'选项\s*([ABCD])\s*正确'          # 描述性格式
+            ]
+            
+            for pattern in patterns:
+                match = re.search(pattern, answer_part, re.IGNORECASE)
+                if match:
+                    return match.group(1).upper()  # 统一返回大写字母
+            
+            # 如果所有模式都失败，尝试最后一个字母
+            last_letter = re.findall(r'[ABCD]', answer_part)
+            return last_letter[-1] if last_letter else None
             
         predicted_answer = extract_answer(model_output)
         if not predicted_answer:
