@@ -74,7 +74,7 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
     }
     
     # 初始化进度条
-    pbar = tqdm(data[1:2], desc="Processing", unit="sample")
+    pbar = tqdm(data, desc="Processing", unit="sample")
     
     def get_gpu_memory():
         if torch.cuda.is_available():
@@ -116,12 +116,15 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         # 初始化状态
         hidden_state = torch.zeros(max_targets, d_model).to(model.device)
         # 使用问题和选项作为目标文本，确保长度不超过最大目标数
-        # 使用TF-IDF动态生成目标文本
-        target_texts = targeted_surprise.tfidf_analysis(context, max_keywords=targeted_surprise.max_targets)
-        # 添加问题和选项
-        target_texts.extend([question] + choices)
-        # 截断到最大目标数
-        target_texts = target_texts[:targeted_surprise.max_targets]
+        # 根据配置生成目标文本
+        target_texts = []
+        if targeted_surprise.enabled:
+            # 使用TF-IDF动态生成目标文本
+            target_texts = targeted_surprise.tfidf_analysis(context, max_keywords=targeted_surprise.max_targets)
+            # 添加问题和选项
+            target_texts.extend([question] + choices)
+            # 截断到最大目标数
+            target_texts = target_texts[:targeted_surprise.max_targets]
         
         # 显存监控
         if torch.cuda.is_available():
@@ -135,9 +138,11 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         tokenized = tokenizer(input_text, return_tensors="pt", truncation=True, padding=False)
         input_ids = tokenized['input_ids'].to(model.device)
         attention_mask = tokenized['attention_mask'].to(model.device)
-        print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
-        print(f"Input IDs: {input_ids}")
-        print(f"Attention mask: {attention_mask}")
+
+        # print(f"Input IDs shape: {input_ids.shape}, Attention mask shape: {attention_mask.shape}")
+        # print(f"Input IDs: {input_ids}")
+        # print(f"Attention mask: {attention_mask}")
+
         output_ids = []
         
         # 上下文嵌入缓存
@@ -146,12 +151,12 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
         # 使用model.generate()进行完整推理
         with torch.no_grad():
             # 先运行一次forward获取logits
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits
-            print(f"Logits shape: {logits.shape}")
-            print(f"Logits min: {logits.min().item()}, max: {logits.max().item()}")
-            print(f"Logits contains NaN: {torch.isnan(logits).any().item()}")
-            print(f"Logits contains Inf: {torch.isinf(logits).any().item()}")
+            # outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # logits = outputs.logits
+            # print(f"Logits shape: {logits.shape}")
+            # print(f"Logits min: {logits.min().item()}, max: {logits.max().item()}")
+            # print(f"Logits contains NaN: {torch.isnan(logits).any().item()}")
+            # print(f"Logits contains Inf: {torch.isinf(logits).any().item()}")
             
             # 生成输出
             outputs = model.generate(
@@ -174,7 +179,10 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             # 优化嵌入向量获取，仅处理最后一个token
             with torch.no_grad():
                 x_emb = model.get_input_embeddings()(input_ids[:, -1:]).to(model.device)
-                surprise, hidden_state = targeted_surprise(x_emb.squeeze(0).float(), hidden_state.float(), target_texts)
+                if targeted_surprise.enabled:
+                    surprise, hidden_state = targeted_surprise(x_emb.squeeze(0).float(), hidden_state.float(), target_texts)
+                else:
+                    surprise = None
             
             # 动态更新上下文（差分更新）
             if surprise is not None and surprise.abs().max() > 0.5:
@@ -200,10 +208,10 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             predicted_answer = "N/A"
         
         # 计算surprise score
-        if 'surprise' in locals():
+        if targeted_surprise.enabled:
             surprise_score = surprise.mean().item() if surprise is not None else 0.0
         else:
-            surprise_score = 0.0
+            surprise_score = None  # 未激活时设为None
             
         # 存储完整结果
         results.append({
@@ -213,8 +221,10 @@ def inference_with_targeted_surprise(model, tokenizer, targeted_surprise, data):
             'predicted_answer': predicted_answer,
             'correct_answer': item['answer'],
             'is_correct': predicted_answer == item['answer'],
-            'surprise_score': surprise_score
         })
+        # 仅在激活时添加surprise_score
+        if targeted_surprise.enabled:
+            results[-1]['surprise_score'] = surprise_score
     
     return results
 
@@ -238,11 +248,11 @@ if __name__ == "__main__":
         results = inference_with_targeted_surprise(model, tokenizer, targeted_surprise, dataset)
     
     # 输出结果
-    for result in results:
-        print(f"Question: {result['question']}")
-        print(f"Model Output: {result['model_output']}")
-        print(f"Surprise Score: {result['surprise_score']:.4f}")
-        print("-" * 50)
+    # for result in results:
+    #     print(f"Question: {result['question']}")
+    #     print(f"Model Output: {result['model_output']}")
+    #     print(f"Surprise Score: {result['surprise_score']:.4f}")
+    #     print("-" * 50)
     
     # 保存报告
     import os

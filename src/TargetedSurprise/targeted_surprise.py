@@ -7,6 +7,8 @@ import jieba
 class TargetedSurprise(nn.Module):
     def __init__(self, d_model, max_targets):
         super().__init__()
+        # 启用标志
+        self.enabled = True
         # 可学习的目标查询向量
         self.target_queries = nn.Parameter(torch.randn(max_targets, d_model))
         
